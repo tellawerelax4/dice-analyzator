@@ -1,0 +1,25 @@
+[project]
+name = "dice-predictor-analyzer"
+version = "0.1.0"
+description = "Desktop analyzer for physical two-dice roll history and adaptive next-sum forecasting."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "PySide6>=6.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+dice-predictor-analyzer = "dice_predictor_analyzer.main:main"
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

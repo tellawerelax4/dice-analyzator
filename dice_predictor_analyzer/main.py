@@ -1,0 +1,9 @@
+"""Application entry point."""
+
+from __future__ import annotations
+
+from .gui import run_app
+
+
+def main() -> int:
+    return run_app()
