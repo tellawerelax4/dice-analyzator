@@ -1,4 +1,5 @@
+"""Run with: python -m dice_predictor_analyzer"""
+
 from .main import main
 
-if __name__ == "__main__":
-    main()
+raise SystemExit(main())

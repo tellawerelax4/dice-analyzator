@@ -1,16 +1,15 @@
-"""In-memory data model for two-dice rolls."""
+"""Core constants and value objects for Rondo/Twist sum analysis."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
-
+from datetime import datetime
 
 MIN_SUM = 2
 MAX_SUM = 12
-DIE_FACES = range(1, 7)
 SUMS = range(MIN_SUM, MAX_SUM + 1)
 MIN_ROLLS_FOR_ANALYSIS = 15
+MAX_PREDICTION_LOG = 100
 
 THEORETICAL_SUM_COUNTS: dict[int, int] = {
     2: 1,
@@ -28,54 +27,28 @@ THEORETICAL_SUM_COUNTS: dict[int, int] = {
 THEORETICAL_SUM_PROBS: dict[int, float] = {
     total: count / 36.0 for total, count in THEORETICAL_SUM_COUNTS.items()
 }
-THEORETICAL_DIE_PROB = 1.0 / 6.0
 
 
 @dataclass(frozen=True, slots=True)
-class Roll:
-    """One completed physical roll of red and blue dice."""
+class RollRecord:
+    """One collected Rondo/Twist result from the site's history DOM."""
 
-    red: int
-    blue: int
+    total: int
+    created_at: datetime
 
     def __post_init__(self) -> None:
-        if self.red not in DIE_FACES or self.blue not in DIE_FACES:
-            raise ValueError("Dice faces must be integers from 1 to 6.")
-
-    @property
-    def total(self) -> int:
-        return self.red + self.blue
+        if self.total not in SUMS:
+            raise ValueError("Roll total must be an integer from 2 to 12.")
 
     def label(self, index: int) -> str:
-        return f"#{index}  {self.red}+{self.blue}={self.total}"
+        return f"#{index}  {self.total}"
 
 
-class RollHistory:
-    """Mutable, memory-only roll history."""
+@dataclass(frozen=True, slots=True)
+class PredictionSnapshot:
+    """Forecast saved before the next actual result is known."""
 
-    def __init__(self, rolls: Iterable[Roll] | None = None) -> None:
-        self._rolls: list[Roll] = list(rolls or [])
-
-    @property
-    def rolls(self) -> tuple[Roll, ...]:
-        return tuple(self._rolls)
-
-    @property
-    def totals(self) -> list[int]:
-        return [roll.total for roll in self._rolls]
-
-    def __len__(self) -> int:
-        return len(self._rolls)
-
-    def add(self, red: int, blue: int) -> Roll:
-        roll = Roll(red=red, blue=blue)
-        self._rolls.append(roll)
-        return roll
-
-    def remove_last(self) -> Roll | None:
-        if not self._rolls:
-            return None
-        return self._rolls.pop()
-
-    def clear(self) -> None:
-        self._rolls.clear()
+    created_at: datetime
+    top5: list[tuple[int, float]]
+    confidence: float
+    actual: int | None = None

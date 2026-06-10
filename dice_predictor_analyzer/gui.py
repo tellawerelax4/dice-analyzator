@@ -1,237 +1,270 @@
-"""PySide6 desktop interface for Dice Predictor Analyzer."""
+"""PySide6 dark desktop interface for Bettery Rondo/Twist analyzer."""
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+import logging
+
+from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import (
     QApplication,
-    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QMainWindow,
+    QMessageBox,
+    QProgressBar,
     QPushButton,
-    QScrollArea,
-    QSizePolicy,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
-from .forecast import ForecastEngine, ForecastReport
-from .model import RollHistory
-from .visualization import SumChartWidget
+from .collector import SeleniumCollector
+from .forecast import Forecast, PredictionEngine
+from .parser import SelectorConfig
+from .statistics import StatisticsEngine
+from .storage import ResultStorage
+from .utils import pct
+from .visualization import BarChart, LineChart, WeightsChart
+
+LOGGER = logging.getLogger(__name__)
 
 
-class DicePredictorWindow(QMainWindow):
-    """Main game-time optimized application window."""
+class CollectorThread(QThread):
+    status_changed = Signal(str)
+    results_found = Signal(list)
+    failed = Signal(str)
 
+    def __init__(self, config: SelectorConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.collector: SeleniumCollector | None = None
+
+    def run(self) -> None:
+        self.collector = SeleniumCollector(
+            self.config,
+            status_callback=self.status_changed.emit,
+            results_callback=self.results_found.emit,
+        )
+        try:
+            self.collector.poll_forever()
+        except Exception as exc:  # noqa: BLE001 - GUI must show clear error instead of crashing.
+            LOGGER.exception("Collector failed")
+            self.failed.emit(str(exc))
+
+    def stop(self) -> None:
+        if self.collector is not None:
+            self.collector.stop()
+        self.quit()
+        self.wait(3000)
+
+
+class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.history = RollHistory()
-        self.engine = ForecastEngine()
-        self.pending_red: int | None = None
-        self.pending_blue: int | None = None
-
-        self.setWindowTitle("Dice Predictor Analyzer")
-        self.resize(1320, 860)
+        self.setWindowTitle("Dice Predictor Analyzer — Bettery Rondo/Twist")
+        self.resize(1500, 950)
+        self.config = SelectorConfig.load()
+        self.storage = ResultStorage()
+        self.statistics = StatisticsEngine()
+        self.engine = PredictionEngine(self.statistics)
+        self.collector_thread: CollectorThread | None = None
         self._build_ui()
         self._apply_style()
-        self._refresh(self.engine.report(list(self.history.rolls)))
+        self._refresh(self.engine.forecast(self.storage.totals))
 
     def _build_ui(self) -> None:
         root = QWidget()
-        main_layout = QHBoxLayout(root)
-        main_layout.setContentsMargins(14, 14, 14, 14)
-        main_layout.setSpacing(14)
-        main_layout.addWidget(self._build_left_panel(), 0)
-        main_layout.addWidget(self._build_right_panel(), 1)
         self.setCentralWidget(root)
+        layout = QHBoxLayout(root)
+        splitter = QSplitter()
+        layout.addWidget(splitter)
 
-    def _build_left_panel(self) -> QWidget:
-        panel = QFrame()
-        panel.setObjectName("leftPanel")
-        layout = QVBoxLayout(panel)
-        layout.setSpacing(12)
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        self.connection_label = QLabel("Подключение: не запущено")
+        self.parser_label = QLabel("Парсер: ожидание")
+        self.count_label = QLabel("Бросков собрано: 0")
+        self.last_label = QLabel("Последний результат: —")
+        for label in [self.connection_label, self.parser_label, self.count_label, self.last_label]:
+            label.setObjectName("statusLabel")
+            left_layout.addWidget(label)
 
-        title = QLabel("Ввод броска")
-        title.setObjectName("sectionTitle")
-        layout.addWidget(title)
-        self.red_status = QLabel("Красный кубик: не выбран")
-        self.blue_status = QLabel("Синий кубик: не выбран")
-        layout.addWidget(self.red_status)
-        layout.addWidget(self._dice_group("Красный кубик", "red"))
-        layout.addWidget(self.blue_status)
-        layout.addWidget(self._dice_group("Синий кубик", "blue"))
+        buttons = QHBoxLayout()
+        self.start_button = QPushButton("Запустить Selenium сбор")
+        self.stop_button = QPushButton("Остановить")
+        self.stop_button.setEnabled(False)
+        self.start_button.clicked.connect(self.start_collection)
+        self.stop_button.clicked.connect(self.stop_collection)
+        buttons.addWidget(self.start_button)
+        buttons.addWidget(self.stop_button)
+        left_layout.addLayout(buttons)
 
-        history_title = QLabel("История бросков")
-        history_title.setObjectName("sectionTitle")
-        layout.addWidget(history_title)
         self.history_list = QListWidget()
-        self.history_list.setMinimumWidth(310)
-        self.history_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        layout.addWidget(self.history_list, 1)
+        history_box = self._box("История результатов из DOM", self.history_list)
+        left_layout.addWidget(history_box, 1)
+        self.log_list = QListWidget()
+        left_layout.addWidget(self._box("Статус/диагностика", self.log_list), 1)
 
-        delete_button = QPushButton("Удалить последний бросок")
-        delete_button.setObjectName("dangerButton")
-        delete_button.clicked.connect(self._delete_last)
-        layout.addWidget(delete_button)
-        return panel
-
-    def _dice_group(self, title: str, die: str) -> QGroupBox:
-        group = QGroupBox(title)
-        grid = QGridLayout(group)
-        grid.setSpacing(8)
-        for face in range(1, 7):
-            button = QPushButton(str(face))
-            button.setMinimumSize(78, 62)
-            button.clicked.connect(lambda _checked=False, f=face, d=die: self._select_die(d, f))
-            row = 0 if face <= 3 else 1
-            col = (face - 1) % 3
-            grid.addWidget(button, row, col)
-        return group
-
-    def _build_right_panel(self) -> QWidget:
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        content = QWidget()
-        layout = QVBoxLayout(content)
-        layout.setSpacing(12)
-
-        self.status_label = QLabel()
-        self.status_label.setObjectName("statusLabel")
-        self.status_label.setWordWrap(True)
-        layout.addWidget(self.status_label)
-
-        self.top_label = QLabel("ТОП-5 рекомендуемых сумм")
-        self.top_label.setObjectName("sectionTitle")
-        layout.addWidget(self.top_label)
-        self.top_text = QTextEdit()
-        self.top_text.setReadOnly(True)
-        self.top_text.setMaximumHeight(170)
-        layout.addWidget(self.top_text)
-
+        right = QWidget()
+        right_layout = QGridLayout(right)
+        self.top_label = QLabel()
+        self.signal_bar = QProgressBar()
+        self.signal_bar.setRange(0, 100)
         self.range_label = QLabel()
-        self.range_label.setObjectName("rangeLabel")
-        layout.addWidget(self.range_label)
+        self.parity_label = QLabel()
+        self.hot_label = QLabel()
+        self.cold_label = QLabel()
+        self.absent_label = QLabel()
+        self.weights_label = QLabel()
+        self.accuracy_label = QLabel()
+        self.insights_label = QLabel()
+        for label in [self.top_label, self.range_label, self.parity_label, self.hot_label, self.cold_label, self.absent_label, self.weights_label, self.accuracy_label, self.insights_label]:
+            label.setWordWrap(True)
 
-        latest_title = QLabel("Последние суммы")
-        latest_title.setObjectName("sectionTitle")
-        layout.addWidget(latest_title)
-        self.latest_label = QLabel("—")
-        self.latest_label.setObjectName("latestLabel")
-        self.latest_label.setWordWrap(True)
-        layout.addWidget(self.latest_label)
+        metrics_layout = QVBoxLayout()
+        for title, widget in [
+            ("ТОП-5 прогнозов", self.top_label),
+            ("Сила сигнала", self.signal_bar),
+            ("Диапазоны", self.range_label),
+            ("Чётное / нечётное", self.parity_label),
+            ("Горячие числа", self.hot_label),
+            ("Холодные числа", self.cold_label),
+            ("Отсутствующие числа", self.absent_label),
+            ("Текущие веса", self.weights_label),
+            ("Статистика точности", self.accuracy_label),
+            ("Аналитика", self.insights_label),
+        ]:
+            metrics_layout.addWidget(self._box(title, widget))
+        right_layout.addLayout(metrics_layout, 0, 0, 2, 1)
 
-        chart_title = QLabel("График последних 50 сумм")
-        chart_title.setObjectName("sectionTitle")
-        layout.addWidget(chart_title)
-        self.chart = SumChartWidget()
-        layout.addWidget(self.chart)
+        self.results_chart = LineChart("График последних 50 результатов", minimum=2, maximum=12)
+        self.signal_chart = LineChart("График силы сигнала", minimum=0, maximum=1)
+        self.weights_chart = WeightsChart()
+        self.distribution_chart = BarChart("Фактическое распределение сумм")
+        charts_layout = QVBoxLayout()
+        for chart in [self.results_chart, self.signal_chart, self.weights_chart, self.distribution_chart]:
+            charts_layout.addWidget(chart)
+        right_layout.addLayout(charts_layout, 0, 1)
 
-        analytics_title = QLabel("Аналитическая панель")
-        analytics_title.setObjectName("sectionTitle")
-        layout.addWidget(analytics_title)
-        self.analytics_text = QTextEdit()
-        self.analytics_text.setReadOnly(True)
-        self.analytics_text.setMinimumHeight(220)
-        layout.addWidget(self.analytics_text)
+        self.journal = QListWidget()
+        self.theory_table = QTableWidget(11, 5)
+        self.theory_table.setHorizontalHeaderLabels(["Сумма", "Теория", "Факт", "Отклонение", "Кол-во"])
+        right_layout.addWidget(self._box("Журнал прогнозов (последние 100)", self.journal), 1, 1)
+        right_layout.addWidget(self._box("Теория / факт / отклонение", self.theory_table), 2, 0, 1, 2)
 
-        theory_title = QLabel("Теоретическая и фактическая статистика сумм")
-        theory_title.setObjectName("sectionTitle")
-        layout.addWidget(theory_title)
-        self.theory_table = QTableWidget(11, 4)
-        self.theory_table.setHorizontalHeaderLabels(["Сумма", "Теория", "Факт", "Отклонение"])
-        self.theory_table.verticalHeader().setVisible(False)
-        self.theory_table.setMinimumHeight(370)
-        layout.addWidget(self.theory_table)
+        splitter.addWidget(left)
+        splitter.addWidget(right)
+        splitter.setSizes([420, 1080])
 
-        scroll.setWidget(content)
-        return scroll
+    def start_collection(self) -> None:
+        if self.collector_thread is not None:
+            return
+        self.collector_thread = CollectorThread(self.config)
+        self.collector_thread.status_changed.connect(self._on_status)
+        self.collector_thread.results_found.connect(self._on_results)
+        self.collector_thread.failed.connect(self._on_failed)
+        self.collector_thread.start()
+        self.connection_label.setText("Подключение: запускается")
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
 
-    def _select_die(self, die: str, face: int) -> None:
-        if die == "red":
-            self.pending_red = face
-            self.red_status.setText(f"Красный кубик: {face}")
-        else:
-            self.pending_blue = face
-            self.blue_status.setText(f"Синий кубик: {face}")
-        if self.pending_red is not None and self.pending_blue is not None:
-            self.history.add(self.pending_red, self.pending_blue)
-            self.pending_red = None
-            self.pending_blue = None
-            self.red_status.setText("Красный кубик: не выбран")
-            self.blue_status.setText("Синий кубик: не выбран")
-            self._refresh(self.engine.ingest_new_roll(list(self.history.rolls)))
+    def stop_collection(self) -> None:
+        if self.collector_thread is not None:
+            self.collector_thread.stop()
+            self.collector_thread = None
+        self.connection_label.setText("Подключение: остановлено")
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
 
-    def _delete_last(self) -> None:
-        self.history.remove_last()
-        self._refresh(self.engine.rebuild(list(self.history.rolls)))
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self.stop_collection()
+        super().closeEvent(event)
 
-    def _refresh(self, report: ForecastReport) -> None:
-        rolls = list(self.history.rolls)
+    def _on_status(self, message: str) -> None:
+        self.parser_label.setText(f"Парсер: {message}")
+        self.log_list.insertItem(0, message)
+        while self.log_list.count() > 100:
+            self.log_list.takeItem(self.log_list.count() - 1)
+
+    def _on_failed(self, message: str) -> None:
+        self._on_status(f"Ошибка: {message}")
+        QMessageBox.warning(self, "Ошибка сбора", message)
+        self.stop_collection()
+
+    def _on_results(self, results: list[int]) -> None:
+        for result in results:
+            self.storage.add_result(int(result))
+            forecast = self.engine.process_new_result(self.storage.totals, int(result))
+        self.connection_label.setText("Подключение: активно")
+        self._refresh(forecast if results else self.engine.forecast(self.storage.totals))
+
+    def _refresh(self, forecast: Forecast) -> None:
+        totals = self.storage.totals
+        self.count_label.setText(f"Бросков собрано: {len(totals)}")
+        self.last_label.setText(f"Последний результат: {self.storage.last_result if self.storage.last_result is not None else '—'}")
         self.history_list.clear()
-        for index, roll in enumerate(rolls, start=1):
-            self.history_list.addItem(roll.label(index))
-        self.history_list.scrollToBottom()
+        for index, record in enumerate(self.storage.records[-250:], start=max(1, len(self.storage.records) - 249)):
+            self.history_list.addItem(record.label(index))
 
-        totals = [roll.total for roll in rolls]
-        self.latest_label.setText(" ".join(str(total) for total in totals[-20:]) if totals else "—")
-        self.chart.set_values(totals[-50:])
-        self.status_label.setText(report.message)
-
-        if not report.enabled:
-            self.top_text.setPlainText(report.message)
-            self.range_label.setText("2–6 → 0.00%     7 → 0.00%     8–12 → 0.00%")
-            self.analytics_text.setPlainText("Аналитика включится автоматически после 15 бросков.")
+        if forecast.enabled:
+            self.top_label.setText("\n".join(f"{index}. {total} — {pct(score)}" for index, (total, score) in enumerate(forecast.top5, start=1)))
         else:
-            self.top_text.setPlainText("\n".join(
-                f"{rank}. {total} — уверенность {confidence:.2f}%"
-                for rank, (total, confidence) in enumerate(report.top5, start=1)
-            ))
-            ranges = report.range_probabilities
-            self.range_label.setText(
-                f"2–6 → {ranges['2–6']:.2f}%     7 → {ranges['7']:.2f}%     8–12 → {ranges['8–12']:.2f}%"
-            )
-            weights = "\n".join(f"{name}: {weight * 100:.1f}%" for name, weight in report.weights.items())
-            self.analytics_text.setPlainText("\n".join(report.insights) + "\n\nТекущие веса алгоритмов:\n" + weights)
-        self._fill_theory_table(report)
+            self.top_label.setText(forecast.message)
+        self.signal_bar.setValue(round(forecast.signal_strength * 100))
+        self.signal_bar.setFormat(f"СИЛА СИГНАЛА: {forecast.signal_strength * 100:.0f}%")
+        self.range_label.setText("\n".join(f"{name}: {pct(value)}" for name, value in forecast.range_probs.items()))
+        self.parity_label.setText("\n".join(f"{name}: {pct(value)}" for name, value in forecast.parity_probs.items()))
+        self.hot_label.setText(", ".join(f"{total} ({count})" for total, count in forecast.hot) or "—")
+        self.cold_label.setText(", ".join(f"{total} ({count})" for total, count in forecast.cold) or "—")
+        self.absent_label.setText("\n".join(f"{total} — отсутствует {gap} бросков" for total, gap in forecast.absent))
+        self.weights_label.setText("\n".join(f"{name}: {pct(weight)}" for name, weight in forecast.weights.items()))
+        self.accuracy_label.setText("\n".join(f"{name}: {pct(value)}" for name, value in self.statistics.accuracy().items()))
+        self.insights_label.setText("\n".join(forecast.insights))
 
-    def _fill_theory_table(self, report: ForecastReport) -> None:
-        for row, (total, theory, fact, deviation) in enumerate(report.theory_rows):
-            values = [str(total), f"{theory:.2f}%", f"{fact:.2f}%", f"{deviation:+.2f}%"]
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                self.theory_table.setItem(row, column, item)
-        self.theory_table.resizeColumnsToContents()
+        self.journal.clear()
+        for item in self.statistics.log:
+            top = ", ".join(f"{total}:{score * 100:.0f}%" for total, score in item.top5)
+            self.journal.addItem(f"{item.created_at:%H:%M:%S} | {top} | сигнал {item.confidence * 100:.0f}% | факт {item.actual}")
+
+        for row, (total, theory, fact, deviation, count) in enumerate(forecast.theory_rows):
+            for column, value in enumerate([str(total), pct(theory), pct(fact), f"{deviation * 100:+.2f}%", str(count)]):
+                self.theory_table.setItem(row, column, QTableWidgetItem(value))
+        self.results_chart.set_values([float(value) for value in totals[-50:]], minimum=2, maximum=12)
+        self.signal_chart.set_values(self.engine.signal_history, minimum=0, maximum=1)
+        self.weights_chart.set_history(self.engine.weights.history)
+        self.distribution_chart.set_totals(totals)
+
+    @staticmethod
+    def _box(title: str, widget: QWidget) -> QGroupBox:
+        box = QGroupBox(title)
+        layout = QVBoxLayout(box)
+        layout.addWidget(widget)
+        return box
 
     def _apply_style(self) -> None:
         self.setStyleSheet(
             """
-            QMainWindow, QWidget { background: #0f172a; color: #e5e7eb; font-size: 18px; }
-            #leftPanel, QGroupBox, QTextEdit, QListWidget, QTableWidget { background: #111827; border: 1px solid #334155; border-radius: 10px; }
-            QPushButton { background: #2563eb; color: white; border: none; border-radius: 10px; font-size: 24px; font-weight: 700; padding: 12px; }
-            QPushButton:hover { background: #1d4ed8; }
-            #dangerButton { background: #dc2626; font-size: 20px; }
-            #dangerButton:hover { background: #b91c1c; }
-            QGroupBox { font-weight: 700; padding-top: 18px; margin-top: 8px; }
-            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; }
-            #sectionTitle { font-size: 24px; font-weight: 800; color: #facc15; }
-            #statusLabel { font-size: 22px; font-weight: 800; color: #93c5fd; }
-            #rangeLabel { font-size: 22px; font-weight: 800; color: #34d399; }
-            #latestLabel { font-size: 24px; font-weight: 800; color: #f97316; }
-            QHeaderView::section { background: #1f2937; color: #e5e7eb; padding: 6px; border: 1px solid #334155; }
+            QMainWindow, QWidget { background: #0f172a; color: #e5e7eb; font-size: 15px; }
+            QGroupBox { border: 1px solid #334155; border-radius: 8px; margin-top: 10px; padding: 10px; font-weight: 700; }
+            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; color: #93c5fd; }
+            QLabel#statusLabel { font-size: 18px; font-weight: 700; padding: 8px; background: #111827; border-radius: 8px; }
+            QPushButton { background: #2563eb; color: white; border: none; border-radius: 8px; padding: 12px; font-size: 16px; font-weight: 700; }
+            QPushButton:disabled { background: #475569; color: #94a3b8; }
+            QListWidget, QTableWidget { background: #111827; border: 1px solid #334155; border-radius: 6px; }
+            QProgressBar { border: 1px solid #334155; border-radius: 8px; text-align: center; height: 30px; background: #111827; }
+            QProgressBar::chunk { background: #22c55e; border-radius: 8px; }
             """
         )
 
 
 def run_app() -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     app = QApplication([])
-    window = DicePredictorWindow()
+    window = MainWindow()
     window.show()
     return app.exec()
