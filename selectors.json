@@ -1,0 +1,14 @@
+{
+  "iframe_id": "quickGame-frame",
+  "poll_interval_ms": 750,
+  "debug_html_path": "debug_page.html",
+  "max_results": 300,
+  "history_order": "newest_first",
+  "result_selectors": [
+    "[data-testid*='history' i] div",
+    "[class*='history' i] div",
+    "[class*='History'] div",
+    ".sc-eXVaYZ",
+    "div"
+  ]
+}
